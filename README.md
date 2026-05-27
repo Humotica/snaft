@@ -175,9 +175,13 @@ Encoded but clean payloads still get `WARN` — encoded text in a chat/prompt co
 
 Credit: Storm van de Meent, 2026-04-24.
 
-## Null-Route MUX
+## Null-Route MUX (MUX-0x00)
 
-Behavioral detection engine for abnormal traffic. When an IP crosses a dual threshold — rate (sliding window) or path repetition — it is marked for null-routing. The adjacent ASGI/Express middleware then holds the connection open and sends nothing. The attacker's connection pool fills up. You absorb the request metadata; they get zero signal (no status code, no error, no timing leak).
+> **Naming note — two different "MUX" layers in the TIBET stack.** The *intent-transport MUX* lives in **tibet-airlock**: it routes agent intents to sandboxed execution (`MUX→KVM→SNAFT→Triage`). The **Null-Route MUX / MUX-0x00** documented here is the SNAFT firewall's detection engine that routes *abnormal* traffic to `0x00` — silence. Same word, different layers. This section is about the latter.
+
+Behavioral detection engine for abnormal traffic. When an IP crosses a dual threshold — rate (sliding window) or path repetition (or fuzzing-grade path entropy) — it is marked for null-routing. You absorb the request metadata; they get zero usable signal.
+
+**Decision engine vs. wire-tactic.** `NullRouteMux` (this package) owns the *decision* (`check` → `should_null_route` → `absorb`). The *wire-tactic* is the adjacent ASGI/Express middleware's responsibility, and there are two valid shapes: hold the connection open and send nothing, **or** send HTTP `200` `response.start` and never the body (the brain-api deployment uses the latter — RS-2026-001 §3.1/§4.2). Either way: no status-meaning, no error, no timing leak. Unit tests for the decision engine: `tests/test_mux_nullroute.py`.
 
 ```python
 from snaft import NullRouteMux
