@@ -1,6 +1,46 @@
 # SNAFT
 
-Semantic Network-Aware Firewall for Trust — behavioral firewall for AI agents with 22 immutable rules covering OWASP LLM Top 10 (2025) and OWASP Agentic Top 10 (2026).
+Semantic Network-Aware Firewall for Trust — behavioral firewall for AI agents with 22 immutable rules covering OWASP LLM Top 10 (2025) and OWASP Agentic Top 10 (2026), plus the airlock-runtime immune-switch (v1.4.0).
+
+## New in 1.4.0 — airlock-runtime immune-switch
+
+`snaft` is now the consumer side of the `tibet-pol → snaft → cap-bus → tibet-airlock`
+immune-switch pipeline (see also: `tibet-cap-bus 0.1.3` and `tibet-pol 0.3.3`).
+
+```python
+from snaft import Firewall
+from snaft.posture import consume_verdict, make_transition_event
+
+# Receive a verdict.v1 record from tibet-pol via cap-bus:
+verdict = {...}  # airlock_runtime_verdict.v1 record
+decision = consume_verdict(verdict)   # frozen PostureDecision with 11 switches
+
+# Install the posture on the firewall:
+fw = Firewall()
+fw.set_posture(decision)
+
+# Early-deny external AI when posture is degraded — vóór any rule evaluation:
+allowed, reason = fw.precheck_posture({"origin": "external_ai"})
+# python_fallback / hard_quarantine: allowed=False, "deny_external_ai_inbound ON"
+
+# Posture-aware rules — only active under matching posture:
+from snaft.firewall import Rule
+strict_marker = Rule.allow_iff_posture(
+    name="strict-marker-when-healthy",
+    description="Require airlock marker only when runtime is healthy",
+    check=lambda agent, erin, erachter: ...,
+    switch="deny_external_ai_inbound",
+    expected=False,  # only applies when external AI is allowed (= healthy)
+)
+fw.add_rule(strict_marker)
+```
+
+Plus **SNAFT-DESTRUCT-001** — a new poison rule at priority 0 that blocks
+`rm -rf /`, `mkfs /dev/sd*`, fork bombs, `systemctl poweroff` and similar
+always-destructive shell patterns, regardless of posture or runtime state.
+Those actions require operator triage out-of-band.
+
+Reference: Codex policy `sandbox/ai/codex/airlock-runtime-policy-immune-switch-2026-05-29.md`.
 
 ## Install
 
@@ -278,6 +318,9 @@ Built by [Jasper van de Meent](https://github.com/jaspertvdm) as part of [Humoti
 Based on OWASP LLM Top 10 (2025), OWASP Agentic Top 10 (2026), TIBET provenance framework, and the AInternet.
 
 
+---
+
+**Stack-positie:** Groep `safety` · Bootstrap = OSAPI-handshake naar [`tibet`](https://pypi.org/project/tibet-core/) + [`jis`](https://pypi.org/project/jis-core/) (fail → snaft-rule + tibet-pol-rapport) · ← [`tibet-cap-bus`](https://pypi.org/project/tibet-cap-bus/) · [`tibet-airlock`](https://pypi.org/project/tibet-airlock/) → · See `STACK.md` · See `demo/golden-path/` for the spine end-to-end.
 ---
 
 ## Enterprise

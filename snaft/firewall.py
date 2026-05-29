@@ -65,6 +65,17 @@ class Rule:
 
     Rules are checked in priority order (lower number = checked first).
     First matching rule wins. Immutable rules cannot be removed.
+
+    Posture-aware rules:
+        Set `posture_required` to a dict of {switch_name: expected_bool} to
+        make a rule conditionally active. The rule only applies when the
+        active PostureDecision has ALL listed switches matching the expected
+        values. Use `applies_under_posture(posture)` to query.
+
+        Example:
+            # Rule that only fires when external AI is allowed (= healthy mode)
+            Rule(name="strict-marker-check", ...,
+                 posture_required={"deny_external_ai_inbound": False})
     """
 
     name: str
@@ -74,6 +85,7 @@ class Rule:
     check: Callable[..., bool] = field(default=lambda *a: False)
     immutable: bool = False
     _poison: bool = field(default=False, repr=False)  # Hidden core rules
+    posture_required: Optional[Dict[str, bool]] = None
 
     def matches(self, agent_id: str, erin: Any, erachter: str,
                 eromheen: Optional[Dict] = None) -> bool:
@@ -83,14 +95,61 @@ class Rule:
         except Exception:
             return True  # Fail-closed
 
+    def applies_under_posture(self, posture) -> bool:
+        """True if this rule should be evaluated given the active posture.
+
+        - If posture_required is None: always applies (backwards-compatible).
+        - If posture is None (no posture set): applies (conservative default).
+        - If posture set: every required switch must match its expected value.
+        """
+        if self.posture_required is None:
+            return True
+        if posture is None:
+            return True
+        for switch, expected in self.posture_required.items():
+            actual = getattr(posture, switch, None)
+            if actual != expected:
+                return False
+        return True
+
+    @classmethod
+    def allow_iff_posture(
+        cls,
+        name: str,
+        description: str,
+        check: Callable[..., bool],
+        switch: str,
+        expected: bool,
+        action: "Action" = None,
+        priority: int = 100,
+    ) -> "Rule":
+        """Builder: a Rule that only applies when posture[switch] == expected.
+
+        Sugar for the common case of one-switch gating. For multi-switch
+        requirements, build a Rule directly with `posture_required={...}`.
+        """
+        if action is None:
+            action = Action.ALLOW
+        return cls(
+            name=name,
+            description=description,
+            action=action,
+            priority=priority,
+            check=check,
+            posture_required={switch: expected},
+        )
+
     def to_dict(self) -> Dict:
-        return {
+        d = {
             "name": self.name,
             "description": self.description,
             "action": self.action.value,
             "priority": self.priority,
             "immutable": self.immutable,
         }
+        if self.posture_required is not None:
+            d["posture_required"] = dict(self.posture_required)
+        return d
 
 
 # =============================================================================
@@ -172,7 +231,93 @@ def _check_identity_tampering(agent_id: str, erin: Any, erachter: str) -> bool:
     return has_identity and has_write
 
 
+# Critical filesystem root paths (used for rm/chmod/chown target detection).
+# A trailing word-boundary or path-separator distinguishes /etc from /etc-mock.
+_CRITICAL_PATH_REGEX = (
+    r"(/(?:\s|$|;|&|\||\*)"                                # bare root: / or /*
+    r"|/(?:etc|usr|var|boot|home|opt|lib|bin|sbin|sys|proc|root|lib64)(?:[/\s;&|]|$))"
+)
+
+
+def _check_destructive_command(agent_id: str, erin: Any, erachter: str) -> bool:
+    """SNAFT-007-DESTRUCT: Block always-destructive shell patterns regardless of posture.
+
+    Even when the trust-kernel + airlock-kernel are fully healthy, certain
+    actions must never proceed through the AI path — they require operator
+    triage out-of-band. Examples: rm -rf /, mkfs /dev/sda, dd of=/dev/sd*,
+    fork bombs, systemctl poweroff.
+
+    This rule sits beside the OWASP poison rules and has no posture_required:
+    it is always active.
+    """
+    text = f"{erin} {erachter}"
+
+    # 1) rm with recursive+force, targeting a critical root path.
+    #    Two-step: detect rm with recursive-flag (any form, any flag order),
+    #    then verify the line targets a critical path. Avoids /tmp false-positives.
+    has_rm_recursive = bool(
+        re.search(
+            r"\brm\s+(?:[\-\w]+\s+)*(?:-[a-z]*r[a-z]*f?|-[a-z]*f[a-z]*r|--recursive|--force)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if has_rm_recursive and re.search(_CRITICAL_PATH_REGEX, text, flags=re.IGNORECASE):
+        return True
+
+    # 2) dd writing directly to a block device
+    if re.search(
+        r"\bdd\s+.*\bof=/dev/(sd[a-z]|nvme\d|hd[a-z]|mmcblk|vd[a-z])",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    # 3) mkfs or wipefs on a block device
+    if re.search(
+        r"\b(?:mkfs(?:\.\w+)?|wipefs)\s+(?:[\-\w]+\s+)*/dev/(?:sd[a-z]|nvme\d|hd[a-z]|mmcblk|vd[a-z])",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    # 4) Redirecting raw output into a block device
+    if re.search(r">\s*/dev/(?:sd[a-z]|nvme\d|hd[a-z])", text, flags=re.IGNORECASE):
+        return True
+
+    # 5) Recursive chmod/chown on a critical path
+    if re.search(
+        r"\b(?:chmod|chown)\s+(?:-R|--recursive)\s+\S+\s+(?:/(?:\s|$|;|&|\|)|/(?:etc|usr|var|boot)\b)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    # 6) Fork bomb
+    if re.search(r":\(\)\s*\{\s*:\|:&\s*\}\s*;\s*:", text):
+        return True
+
+    # 7) System shutdown / halt without operator gate
+    if re.search(
+        r"\b(?:systemctl\s+(?:poweroff|halt|reboot)|shutdown\s+-h\s+now|init\s+0)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
 _POISON_RULES = [
+    Rule(
+        name="SNAFT-DESTRUCT-001",
+        description="Block always-destructive shell patterns (rm -rf /, mkfs/dd on block dev, fork bomb, poweroff). No posture exception — requires operator triage out-of-band.",
+        action=Action.BLOCK,
+        priority=0,  # Priority 0 = checked even before injection (0 < 1)
+        check=_check_destructive_command,
+        immutable=True,
+        _poison=True,
+    ),
     Rule(
         name="SNAFT-001-INJECTION",
         description="Block prompt injection attempts (OWASP LLM01)",
@@ -480,6 +625,12 @@ class Firewall:
         self._poison_fingerprint = _POISON_FINGERPRINT
         self._poison_count = _POISON_COUNT
         self._tampered = False
+
+        # Active airlock-runtime posture (set by snaft.posture.consume_verdict + set_posture).
+        # When None, the firewall behaves as if posture were normal_zero_trust (default safe).
+        # When set, callers consult precheck_posture(context) early in their flow to honor
+        # the immune-switch invariant ("bolle airlock weg = extern AI deny").
+        self._active_posture = None  # Optional[PostureDecision]
 
     def _sort_rules(self) -> None:
         """Sort rules by priority (lower = first)."""
@@ -828,6 +979,83 @@ class Firewall:
         """Shorthand evaluate with agent name string."""
         agent = self.get_or_create_agent(agent_name)
         return self.evaluate(agent, action, intent, context)
+
+    # =========================================================================
+    # AIRLOCK-RUNTIME POSTURE (verdict.v1 consumer interface)
+    # =========================================================================
+
+    def set_posture(self, decision) -> None:
+        """Install an active PostureDecision from a verdict.v1 consumption.
+
+        Typical flow:
+            from snaft.posture import consume_verdict
+            decision = consume_verdict(verdict_record)
+            fw.set_posture(decision)
+
+        Subsequent precheck_posture(context) calls consult this decision.
+        """
+        self._active_posture = decision
+
+    def get_posture(self):
+        """Return the currently-active PostureDecision, or None."""
+        return self._active_posture
+
+    def clear_posture(self) -> None:
+        """Clear the active posture; reverts to default (behave as if normal_zero_trust)."""
+        self._active_posture = None
+
+    def applicable_rules(self, posture=None) -> List[Rule]:
+        """Return rules that should be evaluated given a posture (or self._active_posture).
+
+        Rules with `posture_required` mismatching the active posture are
+        filtered out — they act as "dormant" rules under the current immune
+        state. Rules without `posture_required` are always included.
+        """
+        if posture is None:
+            posture = self._active_posture
+        return [r for r in self._rules if r.applies_under_posture(posture)]
+
+    def precheck_posture(self, context: Optional[Dict] = None) -> Tuple[bool, str]:
+        """Consult the active posture against a request context.
+
+        Returns:
+            (allowed, reason). If allowed is False, the caller MUST NOT proceed
+            to evaluate()/check() — the posture has hard-denied this flow.
+
+        Posture switches consulted (per Codex policy 2026-05-29):
+            - drop_external_traffic       -> hard-drop anything with origin=external
+            - isolate_session             -> deny anything with origin=external (with session-isolation note)
+            - deny_external_ai_inbound    -> deny anything with origin=external_ai
+            - deny_remote_tool_invocation -> deny anything with invokes_remote_tool=True
+            - deny_unsandboxed_execution  -> deny anything with sandboxed=False
+
+        When no posture is set, returns (True, "no posture set (default safe)").
+        """
+        if self._active_posture is None:
+            return True, "no posture set (default safe)"
+
+        ctx = context or {}
+        origin = ctx.get("origin", "internal")
+        invokes_remote_tool = bool(ctx.get("invokes_remote_tool", False))
+        sandboxed = bool(ctx.get("sandboxed", True))  # default: sandboxed
+        p = self._active_posture
+
+        if p.drop_external_traffic and origin in ("external", "external_ai"):
+            return False, f"posture={p.posture}: drop_external_traffic ON (origin={origin})"
+
+        if p.isolate_session and origin in ("external", "external_ai"):
+            return False, f"posture={p.posture}: isolate_session ON (origin={origin})"
+
+        if p.deny_external_ai_inbound and origin == "external_ai":
+            return False, f"posture={p.posture}: deny_external_ai_inbound ON"
+
+        if p.deny_remote_tool_invocation and invokes_remote_tool:
+            return False, f"posture={p.posture}: deny_remote_tool_invocation ON"
+
+        if p.deny_unsandboxed_execution and not sandboxed:
+            return False, f"posture={p.posture}: deny_unsandboxed_execution ON"
+
+        return True, f"posture={p.posture}: precheck pass"
 
     def isolate(self, agent: AgentIdentity, reason: str = "manual isolation") -> ProvenanceToken:
         """Manually isolate an agent."""
